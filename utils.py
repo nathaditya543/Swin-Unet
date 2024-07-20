@@ -4,45 +4,64 @@ from medpy import metric
 from scipy.ndimage import zoom
 import torch.nn as nn
 import SimpleITK as sitk
+import torch.nn.functional as F
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class DiceLoss(nn.Module):
-    def __init__(self, n_classes):
+    def __init__(self, num_classes=1):
         super(DiceLoss, self).__init__()
-        self.n_classes = n_classes
+        self.num_classes = num_classes
 
-    def _one_hot_encoder(self, input_tensor):
-        tensor_list = []
-        for i in range(self.n_classes):
-            temp_prob = input_tensor == i  # * torch.ones_like(input_tensor)
-            tensor_list.append(temp_prob.unsqueeze(1))
-        output_tensor = torch.cat(tensor_list, dim=1)
-        return output_tensor.float()
-
-    def _dice_loss(self, score, target):
-        target = target.float()
-        smooth = 1e-5
-        intersect = torch.sum(score * target)
-        y_sum = torch.sum(target * target)
-        z_sum = torch.sum(score * score)
-        loss = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
-        loss = 1 - loss
-        return loss
-
-    def forward(self, inputs, target, weight=None, softmax=False):
+    def forward(self, inputs, targets, softmax=True):
         if softmax:
-            inputs = torch.softmax(inputs, dim=1)
-        target = self._one_hot_encoder(target)
-        if weight is None:
-            weight = [1] * self.n_classes
-        assert inputs.size() == target.size(), 'predict {} & target {} shape do not match'.format(inputs.size(), target.size())
-        class_wise_dice = []
-        loss = 0.0
-        for i in range(0, self.n_classes):
-            dice = self._dice_loss(inputs[:, i], target[:, i])
-            class_wise_dice.append(1.0 - dice.item())
-            loss += dice * weight[i]
-        return loss / self.n_classes
+            inputs = F.softmax(inputs, dim=1)
+        
+        # Assuming one-hot encoding of targets for multi-class calculation
+        if targets.dim() == 3 and self.num_classes > 1:  # Example condition for one-hot encoding requirement
+            targets = F.one_hot(targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        
+        # Flatten label and prediction tensors
+        inputs = inputs.contiguous().view(-1, self.num_classes)
+        targets = targets.contiguous().view(-1, self.num_classes)
+        
+        intersection = (inputs * targets).sum(0)
+        dice = (2. * intersection + 1) / (inputs.sum(0) + targets.sum(0) + 1)
+        return 1 - dice.mean()  # Averaging over classes
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.8, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        # Assuming inputs are logits and targets are one-hot encoded
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)  # Prevents nans when probability 0
+        F_loss = self.alpha * ((1 - pt) ** self.gamma) * BCE_loss
+        return F_loss.mean()
+
+
+class HybridLoss(nn.Module):
+    def __init__(self, alpha=0.5, beta=0.5, num_classes=1):
+        super(HybridLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.dice_loss = DiceLoss(num_classes)
+        self.focal_loss = FocalLoss()
+
+    def forward(self, inputs, targets):
+        # Ensure targets are one-hot encoded for compatibility with the outputs
+        targets = targets.long()  # Ensure targets are long type
+        targets_one_hot = F.one_hot(targets, num_classes=inputs.shape[1]).permute(0, 3, 1, 2).float()
+        
+        dice = self.dice_loss(inputs, targets_one_hot, softmax=True)
+        focal = self.focal_loss(inputs, targets_one_hot)
+        return self.alpha * dice + self.beta * focal
 
 
 def calculate_metric_percase(pred, gt):
