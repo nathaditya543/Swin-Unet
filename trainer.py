@@ -12,11 +12,13 @@ from tensorboardX import SummaryWriter
 from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from utils import HybridLoss
+from utils import DiceLoss
 from torchvision import transforms
 from utils import test_single_volume
 
 def trainer_synapse(args, model, snapshot_path):
+   
+
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
     logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
@@ -38,8 +40,13 @@ def trainer_synapse(args, model, snapshot_path):
                              worker_init_fn=worker_init_fn)
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
+    if torch.cuda.is_available():
+      device = torch.device("cuda")
+      model.to(device)
+    
     model.train()
-    hybrid_loss = HybridLoss(alpha=0.4, beta=0.6, num_classes=9)
+    ce_loss = CrossEntropyLoss()
+    dice_loss = DiceLoss(num_classes)
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
     writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
@@ -51,9 +58,11 @@ def trainer_synapse(args, model, snapshot_path):
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
-            image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
+            image_batch, label_batch = image_batch.to(device), label_batch.to(device)
             outputs = model(image_batch)
-            loss = hybrid_loss(outputs, label_batch)
+            loss_ce = ce_loss(outputs, label_batch[:].long())
+            loss_dice = dice_loss(outputs, label_batch, softmax=True)
+            loss = 0.4 * loss_ce + 0.6 * loss_dice
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -64,8 +73,9 @@ def trainer_synapse(args, model, snapshot_path):
             iter_num = iter_num + 1
             writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/total_loss', loss, iter_num)
+            writer.add_scalar('info/loss_ce', loss_ce, iter_num)
 
-            logging.info('iteration %d : loss : %f'% (iter_num, loss.item()))
+            logging.info('iteration %d : loss : %f, loss_ce: %f' % (iter_num, loss.item(), loss_ce.item()))
 
             if iter_num % 20 == 0:
                 image = image_batch[1, 0:1, :, :]
