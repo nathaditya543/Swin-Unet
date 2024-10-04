@@ -15,6 +15,7 @@ from tqdm import tqdm
 from utils import DiceLoss
 from torchvision import transforms
 from utils import test_single_volume
+from sklearn.metrics import confusion_matrix, jaccard_score
 
 def trainer_synapse(args, model, snapshot_path):
    
@@ -55,17 +56,31 @@ def trainer_synapse(args, model, snapshot_path):
     logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
     best_performance = 0.0
     iterator = tqdm(range(max_epoch), ncols=70)
+
+    conf_matrix_sum = np.zeros((num_classes, num_classes))  # Initialize at the beginning
+    miou_sum = 0
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
             image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             image_batch, label_batch = image_batch.to(device), label_batch.to(device)
             outputs = model(image_batch)
+
+            preds = torch.argmax(torch.softmax(outputs, dim=1), dim=1).to(device).cpu().numpy()
+            labels = label_batch.cpu().numpy().flatten()
+            
+            conf_matrix = confusion_matrix(labels, preds.flatten(), labels=range(num_classes))
+            miou = jaccard_score(labels, preds.flatten(), average='macro')
+            
+            conf_matrix_sum += conf_matrix  # Accumulate confusion matrices
+            miou_sum += miou  # Accumulate MIOU
+
             loss_ce = ce_loss(outputs, label_batch[:].long())
             loss_dice = dice_loss(outputs, label_batch, softmax=True)
             loss = 0.4 * loss_ce + 0.6 * loss_dice
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_
@@ -85,7 +100,9 @@ def trainer_synapse(args, model, snapshot_path):
                 writer.add_image('train/Prediction', outputs[1, ...] * 50, iter_num)
                 labs = label_batch[1, ...].unsqueeze(0) * 50
                 writer.add_image('train/GroundTruth', labs, iter_num)
-
+        
+        
+        
         save_interval = 50  # int(max_epoch/6)
         if epoch_num > int(max_epoch / 2) and (epoch_num + 1) % save_interval == 0:
             save_mode_path = os.path.join(snapshot_path, 'epoch_' + str(epoch_num) + '.pth')
@@ -98,6 +115,18 @@ def trainer_synapse(args, model, snapshot_path):
             logging.info("save model to {}".format(save_mode_path))
             iterator.close()
             break
+        
+    # Calculate Confusion Matrix and MIOU
+    intersection = np.diag(conf_matrix_sum)  # True Positives (diagonal of confusion matrix)
+    ground_truth_set = conf_matrix_sum.sum(axis=1)  # Actual per class (sum of rows)
+    predicted_set = conf_matrix_sum.sum(axis=0)  # Predicted per class (sum of columns)
+    
+    union = ground_truth_set + predicted_set - intersection
+    iou_per_class = intersection / union
+    miou = np.mean(iou_per_class)  # Mean of the IOU for all classes
+
+    logging.info(f"Confusion Matrix:\n{conf_matrix_sum}")
+    logging.info(f"Final MIOU: {miou}")
 
     writer.close()
     return "Training Finished!"
